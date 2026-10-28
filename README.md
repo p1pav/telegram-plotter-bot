@@ -23,7 +23,7 @@
 ### 1. Клонирование репозитория
 
 ```bash
-git clone https://github.com/username/telegram-plotter-bot.git
+git clone https://github.com/p1pav/telegram-plotter-bot.git
 cd telegram-plotter-bot
 ```
 
