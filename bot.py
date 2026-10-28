@@ -1,7 +1,8 @@
 import asyncio
 import logging
-import os
 import sys
+import os
+import re
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -9,7 +10,6 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -18,13 +18,10 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
-# Импортируем функцию записи в Google Sheets
-from sheets import add_order_to_sheet
+from sheets import add_order_to_sheet, get_next_order_id, get_user_id_by_order_text
 
-# Загружаем переменные окружения из .env
 load_dotenv()
 
-# ================= НАСТРОЙКИ =================
 TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID_STR = os.getenv("MODERATOR_GROUP_ID")
 
@@ -33,26 +30,20 @@ if not TOKEN or not GROUP_ID_STR:
     sys.exit(1)
 
 MODERATOR_GROUP_ID = int(GROUP_ID_STR)
-# ============================================
 
 router = Router()
 
-# Хранилище для связи сообщений в группе с пользователями
-user_links = {}
-
-# --- Машина состояний (FSM) ---
 class OrderForm(StatesGroup):
     choosing_type = State()
     waiting_pages = State()
-    waiting_handwriting = State()
     waiting_topic = State()
+    waiting_handwriting = State()
     waiting_text = State()
 
-# --- 1. Старт и выбор типа работы ---
+# --- 1. Старт ---
 @router.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
-    
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📝 Конспект", callback_data="type_конспект")],
@@ -60,7 +51,6 @@ async def start_handler(message: Message, state: FSMContext):
             [InlineKeyboardButton(text="📚 Доклад", callback_data="type_доклад")],
         ]
     )
-    
     await message.answer(
         f"Здравствуйте, <b>{message.from_user.full_name}</b>! 👋\n\n"
         "Я помогу вам оформить заказ. Что вам нужно подготовить?",
@@ -69,71 +59,52 @@ async def start_handler(message: Message, state: FSMContext):
     )
     await state.set_state(OrderForm.choosing_type)
 
-# --- 2. Обработка выбора типа ---
+# --- 2. Тип ---
 @router.callback_query(F.data.startswith("type_"), OrderForm.choosing_type)
 async def process_type(callback: CallbackQuery, state: FSMContext):
     work_type = callback.data.split("_")[1]
     await state.update_data(work_type=work_type)
-    
-    await callback.message.edit_text(
-        f"Вы выбрали: <b>{work_type.capitalize()}</b>.\n\n"
-        "Сколько страниц вам нужно? (Напишите число, например: 10)",
-        parse_mode=ParseMode.HTML
-    )
+    await callback.message.edit_text(f"Вы выбрали: <b>{work_type.capitalize()}</b>.\n\nСколько страниц вам нужно?", parse_mode=ParseMode.HTML)
     await state.set_state(OrderForm.waiting_pages)
     await callback.answer()
 
-# --- 3. Количество страниц ---
+# --- 3. Страницы ---
 @router.message(OrderForm.waiting_pages)
 async def process_pages(message: Message, state: FSMContext):
     if not message.text or not message.text.isdigit():
-        await message.answer("Пожалуйста, отправьте количество страниц числом (например, 5).")
+        await message.answer("Пожалуйста, отправьте количество страниц числом.")
         return
-    
     await state.update_data(pages=message.text)
-    await message.answer(
-        "Отлично! Теперь отправьте <b>фотографию вашего почерка</b>, "
-        "чтобы мы могли подобрать исполнителя.",
-        parse_mode=ParseMode.HTML
-    )
-    await state.set_state(OrderForm.waiting_handwriting)
-
-# --- 4. Фото почерка ---
-@router.message(OrderForm.waiting_handwriting, F.photo)
-async def process_handwriting(message: Message, state: FSMContext):
-    await state.update_data(handwriting_photo=message.photo[-1].file_id)
-    
-    await message.answer(
-        "Принято! Теперь напишите <b>тему</b> вашей работы.",
-        parse_mode=ParseMode.HTML
-    )
+    await message.answer("Принято! Теперь напишите <b>тему</b> вашей работы.", parse_mode=ParseMode.HTML)
     await state.set_state(OrderForm.waiting_topic)
 
-@router.message(OrderForm.waiting_handwriting)
-async def process_handwriting_error(message: Message):
-    await message.answer("Пожалуйста, отправьте именно <b>фотографию</b> почерка.", parse_mode=ParseMode.HTML)
-
-# --- 5. Тема ---
+# --- 4. Тема ---
 @router.message(OrderForm.waiting_topic)
 async def process_topic(message: Message, state: FSMContext):
     if not message.text:
         await message.answer("Пожалуйста, напишите тему текстом.")
         return
-    
     await state.update_data(topic=message.text)
-    await message.answer(
-        "И последний шаг: отправьте <b>текст</b> вашей работы.\n\n"
-        "Вы можете отправить его обычным сообщением или <b>фотографией</b> (если текст написан от руки/на фото).",
-        parse_mode=ParseMode.HTML
-    )
+    await message.answer("Отлично! Теперь отправьте <b>фотографию вашего почерка</b>.", parse_mode=ParseMode.HTML)
+    await state.set_state(OrderForm.waiting_handwriting)
+
+# --- 5. Почерк ---
+@router.message(OrderForm.waiting_handwriting, F.photo)
+async def process_handwriting(message: Message, state: FSMContext):
+    await state.update_data(handwriting_photo=message.photo[-1].file_id)
+    await message.answer("И последний шаг: отправьте <b>текст</b> работы (текстом или фото).", parse_mode=ParseMode.HTML)
     await state.set_state(OrderForm.waiting_text)
 
-# --- 6. Прием текста работы, запись в Sheets и отправка в группу ---
+@router.message(OrderForm.waiting_handwriting)
+async def process_handwriting_error(message: Message):
+    await message.answer("Пожалуйста, отправьте именно <b>фотографию</b> почерка.", parse_mode=ParseMode.HTML)
+
+# --- 6. Финальный шаг ---
 @router.message(OrderForm.waiting_text, F.text | F.photo | F.document)
 async def process_final_text(message: Message, state: FSMContext, bot: Bot):
+    print(">>> [LOG] Начало обработки финального текста")
     data = await state.get_data()
     
-    # Определяем тип контента для сводки
     if message.text:
         content_type = "📝 Текстом"
         content_preview = message.text[:100] + "..." if len(message.text) > 100 else message.text
@@ -150,9 +121,15 @@ async def process_final_text(message: Message, state: FSMContext, bot: Bot):
         await message.answer("Пожалуйста, отправьте текст работы текстом или фотографией.")
         return
 
-    # 1. ЗАПИСЬ В GOOGLE SHEETS (в отдельном потоке)
+    print(">>> [LOG] Запрос ID у Google Sheets...")
+    # Оборачиваем в to_thread, чтобы не блокировать бота
+    order_id = await asyncio.to_thread(get_next_order_id)
+    print(f">>> [LOG] Получен ID: {order_id}")
+
+    print(">>> [LOG] Отправка данных в Google Sheets...")
     sheets_success = await asyncio.to_thread(
         add_order_to_sheet,
+        order_id=order_id,
         user_id=message.from_user.id,
         full_name=message.from_user.full_name,
         username=message.from_user.username,
@@ -161,26 +138,24 @@ async def process_final_text(message: Message, state: FSMContext, bot: Bot):
         topic=data.get('topic'),
         text_preview=text_for_sheet
     )
+    print(f">>> [LOG] Результат записи в Sheets: {sheets_success}")
     
     if not sheets_success:
-        await bot.send_message(
-            MODERATOR_GROUP_ID,
-            f"⚠️ Не удалось записать заявку в Google Sheets для пользователя {message.from_user.id}."
-        )
+        await bot.send_message(MODERATOR_GROUP_ID, f"⚠️ Ошибка записи в Sheets для заявки {order_id}")
 
-    # 2. ОТПРАВКА В ГРУППУ
     summary = (
-        f"🆕 <b>Новая заявка!</b>\n\n"
+        f"🆕 <b>Заявка {order_id}</b>\n\n"
         f"👤 <b>Пользователь:</b> {message.from_user.full_name}\n"
         f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
         f"🔗 <b>Юзернейм:</b> @{message.from_user.username if message.from_user.username else 'скрыт'}\n\n"
-        f"📂 <b>Тип работы:</b> {data.get('work_type').capitalize()}\n"
+        f"📂 <b>Тип:</b> {data.get('work_type').capitalize()}\n"
         f"📄 <b>Страниц:</b> {data.get('pages')}\n"
         f"💡 <b>Тема:</b> {data.get('topic')}\n"
         f"✍️ <b>Текст работы:</b> {content_type}\n"
         f"<blockquote>{content_preview}</blockquote>"
     )
 
+    print(">>> [LOG] Отправка сводки в группу...")
     try:
         summary_msg = await bot.send_message(
             chat_id=MODERATOR_GROUP_ID,
@@ -189,10 +164,11 @@ async def process_final_text(message: Message, state: FSMContext, bot: Bot):
         )
         
         if data.get('handwriting_photo'):
+            print(">>> [LOG] Отправка фото почерка в группу...")
             await bot.send_photo(
                 chat_id=MODERATOR_GROUP_ID,
                 photo=data['handwriting_photo'],
-                caption="✍️ Почерк пользователя",
+                caption=f"✍️ Почерк (Заявка {order_id})",
                 reply_to_message_id=summary_msg.message_id
             )
 
@@ -201,115 +177,113 @@ async def process_final_text(message: Message, state: FSMContext, bot: Bot):
         elif message.document:
             await message.send_copy(chat_id=MODERATOR_GROUP_ID, reply_to_message_id=summary_msg.message_id)
 
-        # Связываем сообщение в группе с пользователем
-        user_links[summary_msg.message_id] = message.from_user.id
-        
+        print(">>> [LOG] Отправка подтверждения пользователю...")
         await message.answer(
-            "🙏 <b>Спасибо за обращение!</b>\n\n"
-            "Ваша заявка принята и записана в базу. Модератор свяжется с вами в ближайшее время.",
+            f"🙏 <b>Спасибо за обращение!</b>\n\n"
+            f"Ваша заявка <b>{order_id}</b> принята. Модератор свяжется с вами в ближайшее время.",
             parse_mode=ParseMode.HTML
         )
+        print(">>> [LOG] Заявка успешно обработана!")
         
     except Exception as e:
         logging.error(f"Ошибка при отправке в группу: {e}")
-        await message.answer("⚠️ Произошла ошибка при отправке заявки. Попробуйте позже.")
-    
-    await state.clear()
+        await message.answer("⚠️ Произошла ошибка при отправке. Попробуйте позже.")
+    finally:
+        # Обязательно очищаем состояние, чтобы бот не завис в ожидании
+        await state.clear()
+        print(">>> [LOG] Состояние очищено.")
 
-# --- 7. Ответ модератора ---
+# =====================================================================
+# ЛОГИКА ОТВЕТОВ
+# =====================================================================
+
+# --- 7. Модератор отвечает пользователю (из группы) ---
 @router.message(F.chat.id == MODERATOR_GROUP_ID, F.reply_to_message)
 async def moderator_reply_handler(message: Message, bot: Bot):
-    replied_msg_id = message.reply_to_message.message_id
-    user_id = user_links.get(replied_msg_id)
+    print(">>> [LOG] Модератор сделал реплай.")
+    replied_msg = message.reply_to_message
+    replied_text = replied_msg.text or replied_msg.caption or ""
     
-    if not user_id:
-        await message.reply("⚠️ Не удалось определить пользователя. Отвечайте реплаем на <b>первое</b> сообщение со сводкой заявки.", parse_mode=ParseMode.HTML)
+    if "Заявка #" not in replied_text:
+        print(">>> [LOG] Это не ответ на заявку. Игнорируем.")
         return
 
+    print(">>> [LOG] Ищем пользователя по тексту заявки...")
+    user_id = await asyncio.to_thread(get_user_id_by_order_text, replied_text)
+    
+    if not user_id:
+        await message.reply("⚠️ Не удалось найти пользователя для этой заявки в таблице.")
+        return
+
+    match = re.search(r'Заявка (#\d+)', replied_text)
+    order_id = match.group(1) if match else ""
+
+    text_to_user = (
+        f"📬 <b>Ответ от модератора по заявке {order_id}:</b>\n\n"
+        f"{message.text or 'Модератор отправил вложение.'}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✉️ <i>Чтобы ответить, сделайте <b>реплай</b> на это сообщение.</i>"
+    )
+
     try:
-        await bot.send_message(
+        sent_msg = await bot.send_message(
             chat_id=user_id,
-            text=f"📬 <b>Ответ от модератора:</b>\n\n{message.text or 'Модератор отправил вложение.'}",
+            text=text_to_user,
             parse_mode=ParseMode.HTML
         )
-        await message.reply("✅ Ответ успешно отправлен пользователю.")
+        if message.photo or message.document:
+            await message.send_copy(chat_id=user_id, reply_to_message_id=sent_msg.message_id)
+
+        await message.reply(f"✅ Ответ отправлен пользователю (ID: {user_id}).")
     except Exception as e:
         logging.error(f"Ошибка отправки пользователю {user_id}: {e}")
-        await message.reply(f"❌ Не удалось отправить сообщение пользователю. Возможно, он заблокировал бота.\nОшибка: {e}")
+        await message.reply(f"❌ Не удалось отправить сообщение. Пользователь мог заблокировать бота.")
 
-# Консоль для отладки
-async def console_listener(bot: Bot, dp: Dispatcher):
-    """Слушает ввод в консоли и управляет ботом."""
-    print("\n💻 Консоль управления запущена.")
-    print("Доступные команды: 'restart' (перезапуск), 'stop' (остановка), 'help'")
+# --- 8. Пользователь отвечает модератору (из лички) ---
+@router.message(F.chat.type == "private", F.reply_to_message)
+async def user_reply_handler(message: Message, bot: Bot):
+    print(">>> [LOG] Пользователь сделал реплай.")
+    replied_text = message.reply_to_message.text or message.reply_to_message.caption or ""
     
-    while True:
-        # Используем to_thread, чтобы input() не блокировал работу бота
-        try:
-            command = await asyncio.to_thread(input, "> ")
-        except EOFError:
-            break
-            
-        command = command.strip().lower()
-        
-        if command == "restart":
-            print("🔄 Перезапуск бота...")
-            # Останавливаем polling
-            await dp.stop_polling()
-            # Небольшая пауза для корректного закрытия сессий
-            await asyncio.sleep(1)
-            print("✅ Бот перезапущен. Ожидаю сообщения...")
-            # Запускаем polling заново в фоновой задаче
-            asyncio.create_task(dp.start_polling(bot))
-            
-        elif command == "stop":
-            print("🛑 Остановка бота...")
-            await dp.stop_polling()
-            # Выходим из программы
-            raise SystemExit(0)
-            
-        elif command == "help":
-            print("Доступные команды: 'restart' (перезапуск), 'stop' (остановка)")
-        elif command == "":
-            continue
-        else:
-            print(f"❌ Неизвестная команда: '{command}'. Напишите 'help'.")
+    if "заявке #" not in replied_text:
+        print(">>> [LOG] Это не ответ на сообщение модератора. Игнорируем.")
+        return
 
-# Запуск
+    summary = (
+        f"💬 <b>Ответ пользователя по заявке</b>\n\n"
+        f"👤 <b>От:</b> {message.from_user.full_name} (ID: <code>{message.from_user.id}</code>)\n"
+        f"Текст сообщения:\n"
+        f"<blockquote>{message.text or '(вложение)'}</blockquote>"
+    )
+
+    try:
+        sent_group_msg = await bot.send_message(
+            chat_id=MODERATOR_GROUP_ID,
+            text=summary,
+            parse_mode=ParseMode.HTML
+        )
+        if message.photo or message.document:
+            await message.send_copy(chat_id=MODERATOR_GROUP_ID, reply_to_message_id=sent_group_msg.message_id)
+            
+        await message.answer("✅ Ваше сообщение доставлено модератору.")
+    except Exception as e:
+        logging.error(f"Ошибка отправки в группу: {e}")
+        await message.answer("⚠️ Не удалось отправить сообщение. Попробуйте позже.")
+
+# --- Запуск ---
 async def main():
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
-    
-    # Убираем delete_webhook, так как он иногда вызывает ошибки при нестабильной сети
-    # await bot.delete_webhook(drop_pending_updates=True)
-    
     logging.info("Бот запущен и готов к работе.")
-    
-    # Запускаем polling в фоновой задаче
-    polling_task = asyncio.create_task(dp.start_polling(bot))
-    
-    # Запускаем консольный слушатель
-    try:
-        await console_listener(bot, dp)
-    except SystemExit:
-        print("Бот завершил работу.")
-    finally:
-        # При выходе корректно останавливаем polling, если он еще работает
-        await dp.stop_polling()
-        polling_task.cancel()
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    
-    # Цикл автоперезапуска при сетевых сбоях
-    import time
     while True:
         try:
             asyncio.run(main())
-        except KeyboardInterrupt:
-            print("\nВыход по Ctrl+C.")
-            break
         except Exception as e:
-            logging.error(f"Критическая ошибка: {e}. Перезапуск через 5 секунд...")
+            logging.error(f"Сетевая ошибка: {e}. Перезапуск через 5 секунд...")
+            import time
             time.sleep(5)
